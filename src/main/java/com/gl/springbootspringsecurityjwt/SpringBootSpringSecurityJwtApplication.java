@@ -45,22 +45,23 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Date;
 import java.util.Set;
 
 @SpringBootApplication
 public class SpringBootSpringSecurityJwtApplication {
-
     public static void main(String[] args) {
         SpringApplication.run(SpringBootSpringSecurityJwtApplication.class, args);
     }
-
 }
 
 @RestController
@@ -75,26 +76,18 @@ class MyController {
     @Autowired
     private AuthenticationManager authenticationManager;
 
-
     @GetMapping("/")
     public String defaultMethod() {
         return "This is default API for everyone";
     }
 
-    @PostMapping("/token")
-    public String getToken(@RequestBody MyUser myUser) {
-        System.out.println("getToken myUser = " + myUser);
-        try {
-            authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(myUser.getUsername(), myUser.getPassword()));
-        } catch (Exception e) {
-            return e.getMessage();
-        }
-        return JwtUtil.generateToken(myUser);
+    @GetMapping("/home")
+    public String homeMethod() {
+        return "This is home API for everyone";
     }
 
     @PostMapping("/register")
     public String register(@RequestBody MyUser myUser) {
-        System.out.println("register myUser = " + myUser);
         if (myUser.getUsername() == null || myUser.getPassword() == null) {
             return "user name or password can not be null";
         }
@@ -109,9 +102,25 @@ class MyController {
         return "user registration done";
     }
 
-    @GetMapping("/home")
-    public String homeMethod() {
-        return "This is home API for everyone";
+    @PostMapping("/token")
+    public ResponseToken getToken(@RequestBody MyUser myUser) {
+        try {
+            authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(myUser.getUsername(), myUser.getPassword()));
+            return ResponseToken.ok(JwtUtil.generateToken(myUser), JwtUtil.generateRefreshToken(myUser));
+        } catch (Exception e) {
+            return ResponseToken.error(e.getMessage());
+        }
+    }
+
+    @GetMapping("/tokenFromRefreshToken")
+    public ResponseToken getTokenFromRefreshToken(@RequestParam String refreshToken) {
+        try {
+            String username = JwtUtil.getUsernameFromRefreshToken(refreshToken);
+            MyUser myUser = repo.findByUsername(username);
+            return ResponseToken.ok(JwtUtil.generateToken(myUser), refreshToken);
+        } catch (Exception e) {
+            return ResponseToken.error(e.getMessage());
+        }
     }
 
     @GetMapping("/public/api1")
@@ -126,7 +135,7 @@ class MyController {
 
     @GetMapping("/admin/api1")
     public String adminApiMethod1() {
-        return "This is for authenticated admin API 1";
+        return "Thigs is for authenticated admin API 1";
     }
 
     @GetMapping("/admin/api2")
@@ -162,7 +171,7 @@ class SecurityConfiguration {
                 .csrf(AbstractHttpConfigurer::disable)
                 .cors(AbstractHttpConfigurer::disable)
                 .authorizeHttpRequests(request -> request
-                        .requestMatchers("/", "/home", "/token", "/register").permitAll()
+                        .requestMatchers("/", "/home", "/token", "/register", "/tokenFromRefreshToken").permitAll()
                         .requestMatchers("/public/**").hasRole("USER")
                         .requestMatchers("/admin/**").hasRole("ADMIN")
                         .anyRequest().authenticated())
@@ -227,6 +236,104 @@ class UserDetailsServiceImpl implements UserDetailsService {
     }
 }
 
+@Component
+class JwtAuthFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private UserDetailsServiceImpl userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
+        try {
+            String authorizationHeader = request.getHeader("Authorization");
+            if (authorizationHeader == null) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+
+            String tokenPrefix = "Bearer ";
+            String token = authorizationHeader.substring(tokenPrefix.length());
+            String username = JwtUtil.getUsername(token);
+            if (username != null && !JwtUtil.isTokenExpiration(token)) {
+                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+                SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities()));
+            }
+        } catch (Exception e) {
+            response.setStatus(HttpStatus.UNAUTHORIZED.value());
+            response.getWriter().write(e.getMessage());
+            response.getWriter().flush();
+            return;
+        }
+
+        filterChain.doFilter(request, response);
+    }
+}
+
+class JwtUtil {
+
+    public static String generateToken(MyUser myUser) {
+        return Jwts.builder()
+                .claim("username", myUser.getUsername())
+                .claim("roles", myUser.getRoles())
+                .issuedAt(new Date(Instant.now().toEpochMilli()))
+                .expiration(new Date(Instant.now().plus(1, ChronoUnit.DAYS).toEpochMilli()))
+                .signWith(signingKey())
+                .compact();
+    }
+
+    public static String generateRefreshToken(MyUser myUser) {
+        return Jwts.builder()
+                .claim("username", myUser.getUsername())
+                .claim("roles", myUser.getRoles())
+                .issuedAt(new Date(Instant.now().toEpochMilli()))
+                .expiration(new Date(Instant.now().plus(30, ChronoUnit.DAYS).toEpochMilli()))
+                .signWith(refreshSigningKey())
+                .compact();
+    }
+
+    public static String getUsername(String token) {
+        return (String) getClaims(token).get("username");
+    }
+
+    public static boolean isTokenExpiration(String token) {
+        return getClaims(token).getExpiration().before(new Date());
+    }
+
+    public static boolean isRefreshTokenExpiration(String token) {
+        return getRefreshClaims(token).getExpiration().before(new Date());
+    }
+
+    public static String getUsernameFromRefreshToken(String token) {
+        return (String) getRefreshClaims(token).get("username");
+    }
+
+    private static Claims getClaims(String token) {
+        return Jwts.parser()
+                .verifyWith(signingKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    private static Claims getRefreshClaims(String token) {
+        return Jwts.parser()
+                .verifyWith(refreshSigningKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    private static SecretKey signingKey() {
+        return Keys.hmacShaKeyFor(SECRET_KEY.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static SecretKey refreshSigningKey() {
+        return Keys.hmacShaKeyFor(REFRESH_SECRET_KEY.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static final String SECRET_KEY = "ab56gdf456s6er3as1232425bxv57fg4dg6dg3c";
+    private static final String REFRESH_SECRET_KEY = "throng35345dff8gjjjas1232425bxv57fg4dg6dg3c";
+}
 
 interface MyUserRepo extends JpaRepository<MyUser, Long> {
 
@@ -251,71 +358,26 @@ class MyUser {
     private Set<String> roles;
 }
 
-class JwtUtil {
-    private static final String SECRET_KEY = "ab56gdf456s6er3as1232425bxv57fg4dg6dg3c";
-    private static final int MINUTES_5 = 5;
+@Data
+class ResponseToken {
+    private String token;
+    private String refreshToken;
+    private String error;
 
-    public static String generateToken(MyUser myUser) {
-        return Jwts.builder()
-                .claim("username", myUser.getUsername())
-                .claim("roles", myUser.getRoles())
-                .issuedAt(new Date(System.currentTimeMillis()))
-                .expiration(new Date(System.currentTimeMillis() + (MINUTES_5 * 60 * 1000)))
-                .signWith(getSigningKey())
-                .compact();
+    private ResponseToken(String error) {
+        this.error = error;
     }
 
-    public static String getUsername(String token) {
-        return (String) getClaims(token).get("username");
+    private ResponseToken(String token, String refreshToken) {
+        this.token = token;
+        this.refreshToken = refreshToken;
     }
 
-    public static boolean isTokenExpiration(String token) {
-        return getClaims(token).getExpiration().before(new Date());
+    public static ResponseToken error(String error) {
+        return new ResponseToken(error);
     }
 
-    public static Claims getClaims(String token) {
-        return Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-    private static SecretKey getSigningKey() {
-        return Keys.hmacShaKeyFor(SECRET_KEY.getBytes(StandardCharsets.UTF_8));
-    }
-}
-
-@Component
-class JwtAuthFilter extends OncePerRequestFilter {
-
-    @Autowired
-    private UserDetailsServiceImpl userDetailsService;
-
-    @Override
-    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
-        try {
-            String authorizationHeader = request.getHeader("Authorization");
-            System.out.println("--- doFilter() :: authorizationHeader = " + authorizationHeader);
-            if (authorizationHeader == null) {
-                filterChain.doFilter(request, response);
-                return;
-            }
-
-            String tokenPrefix = "Bearer ";
-            String token = authorizationHeader.substring(tokenPrefix.length());
-            String username = JwtUtil.getUsername(token);
-            if (username != null && !JwtUtil.isTokenExpiration(token)) {
-                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
-                SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities()));
-            }
-        } catch (Exception e) {
-            response.setStatus(HttpStatus.UNAUTHORIZED.value());
-            response.getWriter().write(e.getMessage());
-            response.getWriter().flush();
-            return;
-        }
-
-        filterChain.doFilter(request, response);
+    public static ResponseToken ok(String token, String refreshToken) {
+        return new ResponseToken(token, refreshToken);
     }
 }
