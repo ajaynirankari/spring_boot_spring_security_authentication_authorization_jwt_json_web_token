@@ -32,7 +32,6 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -55,8 +54,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.Date;
 import java.util.Set;
 
-import static org.springframework.security.config.Customizer.withDefaults;
-
 @SpringBootApplication
 public class SpringBootSpringSecurityJwtApplication {
 
@@ -68,14 +65,15 @@ public class SpringBootSpringSecurityJwtApplication {
 
 @RestController
 class MyController {
-    @Autowired
-    MyUserRepo repo;
 
     @Autowired
-    PasswordEncoder passwordEncoder;
+    private MyUserRepo repo;
 
     @Autowired
-    AuthenticationManager authenticationManager;
+    private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private AuthenticationManager authenticationManager;
 
 
     @GetMapping("/")
@@ -91,7 +89,7 @@ class MyController {
         } catch (Exception e) {
             return e.getMessage();
         }
-        return Jwt.generateToken(myUser);
+        return JwtUtil.generateToken(myUser);
     }
 
     @PostMapping("/register")
@@ -136,13 +134,13 @@ class MyController {
         return "This is for authenticated admin API 2";
     }
 
-    @PreAuthorize("hasRole('ROLE_ADMINSP')")
+    @PreAuthorize("hasRole('ADMINSP')")
     @GetMapping("/private/api1")
     public String privateAdminApiMethod1() {
         return "This is for authenticated private admin API 1";
     }
 
-    @PreAuthorize("hasRole('ROLE_ADMINSP')")
+    @PreAuthorize("hasRole('ADMINSP')")
     @GetMapping("/private/api2")
     public String privateAdminApiMethod2() {
         return "This is for authenticated private admin API 2";
@@ -156,10 +154,7 @@ class MyController {
 class SecurityConfiguration {
 
     @Autowired
-    DBUserDetails dbUserDetails;
-
-    @Autowired
-    JwtAuthFilter jwtAuthFilter;
+    private JwtAuthFilter jwtAuthFilter;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -173,13 +168,12 @@ class SecurityConfiguration {
                         .anyRequest().authenticated())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
-                .formLogin(withDefaults())
                 .build();
     }
 
     @Bean
     public AuthenticationProvider authenticationProvider() {
-        DaoAuthenticationProvider authenticationProvider = new DaoAuthenticationProvider();
+        var authenticationProvider = new DaoAuthenticationProvider();
         authenticationProvider.setUserDetailsService(userDetailsService());
         authenticationProvider.setPasswordEncoder(passwordEncoder());
         return authenticationProvider;
@@ -190,10 +184,9 @@ class SecurityConfiguration {
         return config.getAuthenticationManager();
     }
 
-
     @Bean
     public UserDetailsService userDetailsService() {
-        return (String username) -> dbUserDetails.getUserDetails(username);
+        return new UserDetailsServiceImpl();
     }
 
     @Bean
@@ -215,12 +208,13 @@ class SecurityConfiguration {
 }
 
 @Component
-class DBUserDetails {
+class UserDetailsServiceImpl implements UserDetailsService {
 
     @Autowired
-    MyUserRepo repo;
+    private MyUserRepo repo;
 
-    UserDetails getUserDetails(String username) {
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
         MyUser dbUser = repo.findByUsername(username);
         if (dbUser == null) {
             throw new UsernameNotFoundException("username: " + username + " not found");
@@ -235,6 +229,7 @@ class DBUserDetails {
 
 
 interface MyUserRepo extends JpaRepository<MyUser, Long> {
+
     MyUser findByUsername(String username);
 
     @Transactional
@@ -244,6 +239,7 @@ interface MyUserRepo extends JpaRepository<MyUser, Long> {
 @Data
 @Entity
 class MyUser {
+
     @Id
     @GeneratedValue
     private long id;
@@ -255,28 +251,29 @@ class MyUser {
     private Set<String> roles;
 }
 
-class Jwt {
-    static String secret_key = "ab56gdf456s6er3as1232425bxv57fg4dg6dg3c";
+class JwtUtil {
+    private static final String SECRET_KEY = "ab56gdf456s6er3as1232425bxv57fg4dg6dg3c";
+    private static final int MINUTES_5 = 5;
 
-    static String generateToken(MyUser myUser) {
+    public static String generateToken(MyUser myUser) {
         return Jwts.builder()
                 .claim("username", myUser.getUsername())
                 .claim("roles", myUser.getRoles())
                 .issuedAt(new Date(System.currentTimeMillis()))
-                .expiration(new Date(System.currentTimeMillis() + (2 * 60 * 1000)))
+                .expiration(new Date(System.currentTimeMillis() + (MINUTES_5 * 60 * 1000)))
                 .signWith(getSigningKey())
                 .compact();
     }
 
-    static String getUsername(String token) {
+    public static String getUsername(String token) {
         return (String) getClaims(token).get("username");
     }
 
-    static boolean isTokenExpiration(String token) {
+    public static boolean isTokenExpiration(String token) {
         return getClaims(token).getExpiration().before(new Date());
     }
 
-    static Claims getClaims(String token) {
+    public static Claims getClaims(String token) {
         return Jwts.parser()
                 .verifyWith(getSigningKey())
                 .build()
@@ -284,8 +281,8 @@ class Jwt {
                 .getPayload();
     }
 
-    static SecretKey getSigningKey() {
-        return Keys.hmacShaKeyFor(secret_key.getBytes(StandardCharsets.UTF_8));
+    private static SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(SECRET_KEY.getBytes(StandardCharsets.UTF_8));
     }
 }
 
@@ -293,29 +290,32 @@ class Jwt {
 class JwtAuthFilter extends OncePerRequestFilter {
 
     @Autowired
-    DBUserDetails dbUserDetails;
+    private UserDetailsServiceImpl userDetailsService;
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
         try {
-            String authHeader = request.getHeader("Authorization");
-            if (authHeader == null) {
+            String authorizationHeader = request.getHeader("Authorization");
+            System.out.println("--- doFilter() :: authorizationHeader = " + authorizationHeader);
+            if (authorizationHeader == null) {
                 filterChain.doFilter(request, response);
                 return;
             }
+
             String tokenPrefix = "Bearer ";
-            String token = authHeader.substring(tokenPrefix.length());
-            String username = Jwt.getUsername(token);
-            if (username != null && !Jwt.isTokenExpiration(token)) {
-                UserDetails userDetails = dbUserDetails.getUserDetails(username);
+            String token = authorizationHeader.substring(tokenPrefix.length());
+            String username = JwtUtil.getUsername(token);
+            if (username != null && !JwtUtil.isTokenExpiration(token)) {
+                UserDetails userDetails = userDetailsService.loadUserByUsername(username);
                 SecurityContextHolder.getContext().setAuthentication(new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities()));
             }
         } catch (Exception e) {
-            response.setStatus(HttpStatus.BAD_REQUEST.value());
+            response.setStatus(HttpStatus.UNAUTHORIZED.value());
             response.getWriter().write(e.getMessage());
             response.getWriter().flush();
             return;
         }
+
         filterChain.doFilter(request, response);
     }
 }
